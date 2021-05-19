@@ -26,6 +26,7 @@ from mycroft.skills.intent_services import (
     AdaptService, AdaptIntent, FallbackService, PadatiousService, IntentMatch
 )
 from mycroft.skills.intent_service_interface import open_intent_envelope
+from mycroft.messagebus import Message
 
 
 def _get_message_lang(message):
@@ -106,10 +107,12 @@ class IntentService:
         self.bus.on('mycroft.speech.recognition.unknown', self.reset_converse)
         self.bus.on('mycroft.skills.loaded', self.update_skill_name_dict)
 
-        def add_active_skill_handler(message):
-            self.add_active_skill(message.data['skill_id'])
-
-        self.bus.on('active_skill_request', add_active_skill_handler)
+        self.bus.on('intent.service.skills.activate',
+                    self.handle_activate_skill_request)
+        self.bus.on('intent.service.skills.deactivate',
+                    self.handle_deactivate_skill_request)
+        # TODO backwards compat, deprecate
+        self.bus.on('active_skill_request', self.handle_activate_skill_request)
         self.active_skills = []  # [skill_id , timestamp]
         self.converse_timeout = 5  # minutes to prune active_skills
 
@@ -150,6 +153,20 @@ class IntentService:
             (str) Skill name or the skill id if the skill wasn't found
         """
         return self.skill_names.get(skill_id, skill_id)
+
+    # converse handling
+    def handle_activate_skill_request(self, message):
+        self.add_active_skill(message)
+
+    def handle_deactivate_skill_request(self, message):
+        # TODO imperfect solution - only a skill can deactivate itself
+        # someone can forge this message and emit it raw, but in HolmesV all
+        # skill message should have skill_id in context, so let's make sure
+        # this doesnt happen accidentally
+        skill_id = message.data['skill_id']
+        source_skill = message.context.get("skill_id") or skill_id
+        if skill_id == source_skill:
+            self.remove_active_skill(message)
 
     def reset_converse(self, message):
         """Let skills know there was a problem with speech recognition"""
@@ -200,9 +217,19 @@ class IntentService:
         Arguments:
             skill_id (str): skill to remove
         """
+        if isinstance(skill_id, Message):
+            msg = skill_id
+            skill_id = msg.data.get('skill_id') or msg.context.get('skill_id')
+            msg = msg.reply("intent.service.skills.deactivated",
+                            {"skill_id": skill_id})
+        else:
+            msg = Message("intent.service.skills.deactivated",
+                          {"skill_id": skill_id},
+                          {"source": "IntentService"})
         for skill in self.active_skills:
             if skill[0] == skill_id:
                 self.active_skills.remove(skill)
+                self.bus.emit(msg)
 
     def add_active_skill(self, skill_id):
         """Add a skill or update the position of an active skill.
@@ -213,12 +240,22 @@ class IntentService:
         Arguments:
             skill_id (str): identifier of skill to be added.
         """
+        if isinstance(skill_id, Message):
+            msg = skill_id
+            skill_id = msg.data.get('skill_id') or msg.context.get('skill_id')
+            msg = msg.reply("intent.service.skills.activated",
+                            {"skill_id": skill_id})
+        else:
+            msg = Message("intent.service.skills.activated",
+                          {"skill_id": skill_id},
+                          {"source": "IntentService"})
         # search the list for an existing entry that already contains it
         # and remove that reference
         if skill_id != '':
             self.remove_active_skill(skill_id)
             # add skill with timestamp to start of skill_list
             self.active_skills.insert(0, [skill_id, time.time()])
+            self.bus.emit(msg)
         else:
             LOG.warning('Skill ID was empty, won\'t add to list of '
                         'active skills.')
